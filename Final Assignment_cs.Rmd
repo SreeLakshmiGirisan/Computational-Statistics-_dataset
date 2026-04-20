@@ -1,0 +1,364 @@
+---
+title: "\\small Computational Statistical Methods_Assignment_Plan and EDA"
+author: "W06G03"
+date: "2026-04-19"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document:
+    latex_engine: xelatex
+geometry: margin=0.7in
+---
+
+### 1. Framing and Dataset Selection:
+**1.1 Problem Statement**:
+In urban planning and public safety, identifying the underlying drivers of criminal activity is essential for efficient resource allocation. While traditional crime reporting provides a historical log of "where" and "when" incidents occur, it often lacks the socio-economic context required to understand "why" certain areas are more vulnerable than others. This project addresses the challenge of predicting specific criminal offence subtypes in South Australia by analyzing the intersection of temporal patterns and socio-economic disadvantage.
+**1.2. Research Question**:
+To what extent do temporal (calendar and holiday structure), spatial (suburb proximity), and socio-economic (SEIFA 2021 deciles) features improve the conditional prediction of Level 3 offence subtypes given Level 1 and Level 2 offence categories?
+**1.3.Motivation and Impact**:
+1.Accurate risk detection supports targeted policing, placing patrols where and when they are most needed.
+2.SEIFA–crime links help policymakers design long-term social interventions, not just short-term enforcement.
+3.Better predictions empower communities to improve neighborhood watch, planning, and personal safety.
+
+### 2. Consider & Gather Data
+**2.1 Data Sources**
+**Primary Dataset**: South Australia Police (SAPOL) - 2024-25 Crime Statistics. This dataset provides granular incident data, including dates, suburbs, and a three-level hierarchy of offence descriptions.
+
+Source:https://data.sa.gov.au/data/dataset/crime-statistics/resource/4a553fc6-71fe-4dac-8096-c29abc269c76
+
+**2.1.1 Outcome from the primary dataset** :
+The South Australia Police Crime Statistics dataset originally contained only dates and basic location fields (Date, Suburb, Postcode). This structure is insufficient for a sophisticated classification task because:
+(i) Limited context – Suburb and Postcode are nominal labels that do not describe the socio-economic conditions of an area, so the model cannot learn why crime varies between locations.
+(ii) Weak link to offence type – Predicting 28 Level 3 offence subtypes requires environmental information (e.g., unemployment, economic resources) that basic crime logs do not capture.
+(iii) Insufficient complexity – Using only the primary dataset would not meet the project’s “complex” data requirement.
+
+To overcome these limitations, we chose to integrate the ABS SEIFA 2021 Enrichment Dataset which is ABS Socio-Economic Indexes for Areas (SEIFA) 2021. This provides standardized rankings of Australian areas based on relative socio-economic advantage and disadvantage.
+
+Source:https://www.abs.gov.au/statistics/people/people-and-communities/socio-economic-indexes-areas-seifa-australia/2021#data-downloads
+
+**2.1.2 Data Linkage and Integration** ---shorten it
+To transform these sources into a integrated dataset, we performed the following steps:
+
+**Step 1:** Filtering: We identified that the Suburb and Locality (SAL) codes for South Australia fall within the 40001 to 49999 range and filtered the ABS data accordingly.
+
+**Step 2:** Extraction & Refinement: We targeted four specific SEIFA tables: Advantage/Disadvantage, Disadvantage, Economic Resources, and Employment, extracting the Decile Ranks for each suburb.
+
+**Step 3:** Normalization: Suburb names in both datasets were converted to uppercase and stripped of whitespace to ensure a high-fidelity match.
+
+**Step 4:** Linkage: We executed an inner join using salname (from SEIFA) and Suburb-Incident (from SAPOL) as the primary keys.
+
+**Requirements** :
+```{r}
+library(ggplot2)
+library(tidyr)
+```
+
+**2.2 Dataset Justification (Requirements)** 
+**Loading the dataset** 
+The integrated raw dataset, hosted on GitHub, was imported directly into the analysis using the raw CSV link.
+```{r}
+csv_link <- "https://raw.githubusercontent.com/SreeLakshmiGirisan/Computational-Statistics-_dataset/main/Final_Spatial_Crime_SEIFA.csv"
+df <- read.csv(csv_link)
+```
+**2.2.1. Large Size (>10,000 observations)** 
+```{r}
+dim(df)
+```
+With 76,598 observations, the dataset is significantly larger.
+**2.2.2. Multi-class (Class Distribution & Imbalance)** 
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(fold_output = function(before, options, envir) {
+  if (before) {
+    return(paste0('<details><summary>', options$fold_output, '</summary>\n\n'))
+  } else {
+    return('\n\n</details>')
+  }
+})
+#This part is added just to hide the graphs
+```
+
+```{r, fold_output="Click to see the Plot"}
+# Graphical distribution 
+target_dist <- table(df$Offence.Level.3.Description)
+barplot(sort(target_dist, decreasing = TRUE), 
+        las = 2, cex.names = 0.5, 
+        main = "Class Distribution (Multi-class Imbalance)")
+```
+
+The target variable consists of 28 unique classes, making this a Multi-class classification problem. There is severe Class Imbalance common offences like "Other Theft" have thousands of entries, while "Murder" has very few. 
+
+**2.2.3. Integration (Data Linkage)** 
+```{r}
+# Show the columns added via integration
+# salcode and SEIFA ranks were not in the primary dataset
+head(df[, c("salcode", "sal_dis", "sal_adv_dis","sal_Economic_Resources","sal_Employment")])
+
+```
+The data linkage process involved an Inner Join. We utilized the Suburb - Incident column from the primary SAPOL dataset and the salname column from the ABS enrichment dataset as the Key. This integration provides the socio-economic context missing from the original police reports.
+
+**2.2.4. Complex (Features & Dimensionality)** 
+```{r}
+# Numerical summary to show mix of continuous and categorical 
+summary(df)
+```
+The data is Complex because it contains a mix of categorical predictors (Suburb, Offence Levels) and continuous SEIFA ranks.
+
+### 3. Exploratory Data Analysis (EDA)
+
+**3.1.Univariate Analysis:** 
+
+**A. Histogram and Bar plots (Numeric Distribution)** 
+```{r, fold_output="Click to see the Plot"}
+# Set up a plotting area for 3 graphs (Week 1)
+par(mfrow = c(1, 3))
+# 1. Distribution of Disadvantage (Integrated SEIFA)
+hist(df$sal_dis, 
+     main = "SEIFA Disadvantage Index", 
+     xlab = "Decile (1=Most, 10=Least)", 
+     ylab = "Frequency of Crime",
+     col = "lightblue",
+     breaks = 10)
+# 2. Distribution of Economic Resources (Integrated SEIFA)
+hist(df$sal_Economic_Resources, 
+     main = "SEIFA Economic Resources Index", 
+     xlab = "Decile Rank", 
+     ylab = "Frequency of Crime",
+     col = "lightgreen",
+     breaks = 10)
+# 3. Showing the count of incidents by part of the week
+# 1. Frequency Table
+# 0 = Weekday, 1 = Weekend
+barplot(table(df$IsWeekend), 
+        main = "Crime : Weekday vs Weekend", 
+        names.arg = c("Weekday", "Weekend"),
+        col = c("steelblue", "darkorange"),
+        ylab = "Number of Incidents")
+```
+**SEIFA Disadvantage Index**- The disadvantage deciles are right‑skewed: most incidents occur in highly disadvantaged suburbs (low deciles), with very few in the most advantaged decile 10.
+**SEIFA Economic Resources Index**- Economic resources are left‑skewed: incidents cluster in both resource‑poor areas (decile 1) and strongly in resource‑rich hubs such as Adelaide CBD (decile 10).
+**Crime: Weekday vs Weekend**-Incidents are more frequent on weekdays than weekends, but weekends may still shift the mix of offence types, so this binary flag is kept as a temporal prior in the model.
+Together, these plots show that crime is concentrated in specific socio‑economic strata and varies over the week, supporting their use as key predictive features.
+
+**B. Missing Values** 
+```{r, fold_output="Click to see the Plot"}
+library(ggplot2)
+
+miss_df <- data.frame(
+  variable = names(df),
+  missing_pct = sapply(df, function(x) mean(is.na(x)) * 100))
+miss_df <- miss_df[order(miss_df$missing_pct, decreasing = TRUE), ]
+ggplot(miss_df, aes(x = reorder(variable, missing_pct), y = missing_pct)) +
+  geom_col(fill = "red") +
+  coord_flip() +
+  labs(
+    title = "Missing Value Percentage per Feature",
+    x = NULL,
+    y = "Percent missing" ) + theme_minimal(base_size = 12) +theme( plot.title = element_text(face = "bold"), axis.text.y = element_text(size = 9) )
+
+```
+Missingness occurs only in the integrated SEIFA variables, and the identical counts across the four SEIFA fields indicate a clustered pattern affecting less than 1.2% of observations, so listwise deletion is acceptable and does not disturb the core crime features.
+These values are missing because some SEIFA salcode values did not successfully match the SAPOL Suburb - Incident field during the inner join, leaving the corresponding SEIFA columns empty for those rows.
+
+**C.Outliers:** 
+
+```{r, fold_output="Click to see the Plot"}
+boxplot(df$Offence.count, 
+        main = "Outlier Detection for Offence Counts", 
+        col = "salmon", 
+        horizontal = TRUE)
+```
+The grouped boxplot shows that property offences cluster in more disadvantaged suburbs while person offences are more spread across SEIFA deciles, confirming SEIFA ranks as a strong predictive feature
+
+**3.2. Bivariate Analysis:** 
+
+**i) SEIFA features with Level 1 offences:** 
+
+```{r, fold_output="Click to see the Plot"}
+# Reshaping the data for a single visualization 
+df_long <- df %>%
+  pivot_longer(cols = c(sal_dis, sal_adv_dis, sal_Economic_Resources, sal_Employment),
+               names_to = "SEIFA_Metric", 
+               values_to = "Decile_Rank")
+# Single Plot: SEIFA Distributions by Crime Type
+ggplot(df_long, aes(x = Offence.Level.1.Description, y = Decile_Rank, fill = SEIFA_Metric)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Socio-Economic Profiles Across Major Offence Categories",
+       x = "Offence Category",
+       y = "SEIFA Decile Rank",
+       fill = "Metric") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Property crimes cluster in lower-SEIFA, lower-employment areas, with tighter spreads across all four indices.The disadvantage index confirms the same pattern: lower ranks indicate greater disadvantage, and higher incident density follows.This clear separation makes the socio-economic variables strong predictors for crime classification.
+
+**ii) Grouped Bar Plot: Check if certain crimes are more likely on the Weekend vs. Weekdays.** 
+```{r, fold_output="Click to see the Plot"}
+# Relationship between Part of Week and Offence Level 1
+counts <- table(df$Offence.Level.1.Description, df$IsWeekend)
+barplot(counts, main = "Crime Type by Weekday/Weekend",
+        col = c("steelblue", "salmon"), 
+        legend = rownames(counts), beside = TRUE)
+```
+Crime reports are higher on weekdays than weekends, reflecting the weekday-heavy calendar pattern.Offences Against Property dominate Offences Against the Person in both periods.This suggests day of week mainly affects total volume, not the crime-type distribution.
+
+**iii) Scatterplot with Loess Smoothing (Sal_dis VS Offence_count) ** 
+```{r, fold_output="Click to see the Plot"}
+#Locally weighted scatter plot smoothing
+library(ggplot2)
+ggplot(df, aes(x = sal_dis, y = Offence.count)) +
+  geom_jitter(alpha = 0.1) + # Jitter helps see overlapping points
+  geom_smooth(method = "loess", span = 0.7) +
+  labs(title = "Trend: SEIFA Rank vs. Offence Count")
+```
+The scatter plot shows a strong non-linear pattern: crime is highest in the most disadvantaged suburbs and drops sharply toward the middle of the SEIFA scale. The LOESS line captures an early steep decline, then flattens, showing that crime stays low in more advantaged areas.
+
+**3.3. Data Visualization: Analyzing the data using Additional graphs/tables with insights**
+
+**3.3.1. Seasonal Distribution of Crime** 
+```{r, fold_output="Click to see the Plot"}
+# Frequency Bar Plot for Seasons 
+# Checking if crime peaks in specific seasons
+season_counts <- table(df$Season_SH)
+barplot(season_counts,  main = "Crime Incident Frequency by Season", col = c("gold", "orange", "skyblue", "lightgreen"), ylab = "Number of Incidents",xlab = "Season")
+```
+**3.3.2 Long Weekend vs. Regular Days ** 
+
+```{r, fold_output="Click to see the Plot"}
+# Comparison of Long Weekends (Week 1)
+# 0 = Regular Day/Weekend, 1 = Long Weekend
+long_weekend_counts <- table(df$IsLongWeekend)
+barplot(long_weekend_counts, main = "Incident Volume: Regular vs. Long Weekends",names.arg = c("Regular", "Long Weekend"),col = c("grey", "darkred"),ylab = "Total Incidents")
+```
+**3.3.3 School Holiday Impact ** 
+
+```{r, fold_output="Click to see the Plot"}
+# Grouped Bar Plot: Crime Type vs School Holidays
+# 0 = No School Holiday, 1 = School Holiday
+holiday_table <- table(df$Offence.Level.1.Description, df$IsSchoolHoliday_SA)
+barplot(holiday_table, beside = TRUE, main = "Crime Categories during School Holidays",col = c("yellow", "darkred"), legend = rownames(holiday_table),names.arg = c("No Holiday", "School Holiday"))
+```
+The added temporal views show that crime in South Australia changes across the calendar, especially by season, long weekend, and school holiday. These features help distinguish when incident volume rises or falls, adding another layer to the socio-economic profile of each case.Combined with SEIFA and location-based variables, they improve the model’s ability to spot high-risk scenarios.
+
+**3.3.4 PCA (Principal Component Analysis)** 
+```{r, fold_output="Click to see the Plot"}
+# PCA for Dimensionality Reduction
+seifa_vars <- na.omit(df[, c("sal_adv_dis", "sal_dis", "sal_Economic_Resources", "sal_Employment")])
+pca_res <- prcomp(seifa_vars, scale. = TRUE)
+# Scree Plot
+plot(pca_res, type = "l", main = "PCA Scree Plot")
+# PCA 2D Scores Plot
+plot(pca_res$x[,1], pca_res$x[,2], xlab="PC1", ylab="PC2", main="2D Projection of Socio-Economic Context")
+```
+The scree plot shows a strong decline after the first component, indicating that most of the variance in the SEIFA variables is explained by PC1. The second component adds limited additional information, while the last two components contribute very little. The 2D PCA projection shows a broad elongated pattern, suggesting the SEIFA indices are correlated and can be summarized using fewer components.
+
+**3.3.5 Pearson Correlation Matrix:** 
+```{r}
+cols <- c("Offence.Count", "sal_adv_dis", "sal_dis",
+          "sal_Economic_Resources", "sal_Employment")
+setdiff(cols, names(df))   
+vars <- df[, intersect(cols, names(df))]
+cor_matrix <- cor(vars, use = "complete.obs")
+round(cor_matrix, 2)
+```
+The correlation matrix shows strong positive associations among the SEIFA indices, especially between sal_adv_dis, sal_dis, and sal_Employment. This indicates that the SEIFA variables are highly related and likely capture overlapping aspects of socio-economic context. 
+
+### 4.Project Planning:
+
+**4.1 Preprocessing:** 
+
+**4.1.1 Missing SEIFA values: ** 
+The dataset has 76,598 rows in total, and 873 rows contain missing values in the SEIFA variables.
+Calculation: 873÷76598×100≈1.14%.
+This is a very small percentage, so removing these rows is unlikely to significantly affect the overall analysis.
+Reason: Keeping incomplete SEIFA records may create problems during modelling and make inaccurate results. Removing them makes the dataset cleaner and easier to work with.
+
+**4.1.2 Feature engineering:** 
+A new binary variable will be created from Offence.Level.1.Description.
+0 = offences against property
+1 = offences against person
+This simplifies the offence category into a form that can be used easily in classification models.
+Reason: Converting the offence type into a binary feature helps the model distinguish between broad crime groups more clearly and reduces complexity in the data.
+
+**4.1.3 Outlier handling: ** 
+Numeric variables such as offence count will be checked using the IQR rule. Extreme values will be removed or treated before modelling to reduce distortion.
+
+**4.1.4 Check for any other redundant data:** 
+If there are any repeated rows in the dataset, they should also be removed to avoid errors or duplication in the analysis.
+
+**4.2 Model Plan:** 
+
+**Logistic Regression:** 
+This will be used as a baseline classification model because it is simple, interpretable, and works well for binary outcomes. It can show how sal_adv_dis, sal_dis, sal_Economic_Resources, and sal_Employment influence the crime category.
+
+**K-Nearest Neighbors (KNN):** 
+This model classifies a record based on the most similar nearby observations. It is useful when areas with similar values of sal_adv_dis, sal_dis, sal_Economic_Resources, and sal_Employment are likely to produce similar crime outcomes.
+
+**Support Vector Machine (SVM):**
+SVM is suitable when the boundary between classes is not very clear. It can handle more complex separation between crime categories using the SEIFA variables and often performs well after scaling the predictors.
+
+**Random Forest:** 
+Random Forest is a strong model for this problem because it can capture non-linear relationships and interactions among sal_adv_dis, sal_dis, sal_Economic_Resources, and sal_Employment. It is also more robust than a single decision tree.
+
+**Linear Discriminant Analysis (LDA):** 
+This will be included as a classical classification model because it creates a linear boundary between classes using the SEIFA variables. It is useful as a comparison model because it is simple and interpretable.
+
+**Ridge Logistic Regression:** 
+This will be added because the SEIFA variables are highly correlated, and ridge regularization helps reduce multicollinearity. It is suitable for binary classification and can improve model stability when predictors such as sal_adv_dis, sal_dis, sal_Economic_Resources, and sal_Employment overlap strongly.
+
+**4.3 Evaluation Plan:** 
+
+**Chosen Performance Metrics**:
+
+1. **Precision and Recall** :
+To reduce false positives, precision is essential (e.g., incorrectly reporting a low-risk suburb for high policing). To capture as many actual cases of major or uncommon crimes as feasible, recall is crucial. Both macro-averaged and major Level 1 category (Property vs. Person) data will be reported.
+2. **Multi-class Confusion Matrix** :
+Enables a thorough examination of the locations of misclassifications (such as the confusion of comparable theft subtypes) and aids in the identification of trends associated with temporal characteristics or SEIFA.
+3. **Accuracy**:
+Easy to interpret for stakeholders, but will not be used for model selection due to imbalance.
+4. **Weighted F1-score**:
+This will be used because it accounts for class frequency and is useful when some offence subtypes appear much more often than others.
+
+**Additional Considerations**:
+**Hyperparameter Tuning** : For models such as Random Forest, SVM, and KNN , the cross-validation loop may use grid search or random search, **Baseline Comparison** : Always compare against a naive baseline (majority class predictor) and the logistic regression baseline, **Computational Efficiency**: Given the large dataset (~76k rows), we will monitor training time and consider down-sampling majority classes or using SMOTE during training (only on training folds) if imbalance severely affects minority class performance.**Interpretability**: For the best-performing model (likely Random Forest), we will extract variable importance plots to quantify the contribution of SEIFA deciles and temporal features, directly supporting the research question.
+
+**4.4 Team Responsibilities, Milestones & Backup Plans:** 
+
+**4.4.1 Milestones** 
+
+| Milestone | Date                  | Deliverable                                      | Responsible Member(s)              |
+|-----------|-----------------------|--------------------------------------------------|------------------------------------|
+| 1         | 20–24 Apr 2026        | Preprocessing and feature engineering   | Sree Lakshmi Girisan              |
+| 2         | 25–30 Apr 2026        | Start with Logistic regression,LDA,Ridge Regression | Deepali Vinayak,  Abhishek |
+| 3         | 1–8 May 2026        | Build other remaining models | Valliappan, Yuanjun he, Sree Lakshmi Girisan|
+| 4         | 9–12 May 2026        | Run stratified cross-validation and compile evaluation results | Valliappan Chidambaram, Deepali |
+| 5         | 13–16 May 2026         | Presentation slide preparation (draft all slides with key visuals) | Abhishek, Yuanjun he |
+| 6         | 17–18 May 2026        | Final presentation slide review, rehearsal, and polishing for live delivery | Whole Team |
+
+**4.4.2 Roles and Team Responsibilites:** 
+
+| Team Member            | Student ID   | Primary Responsibility                                                                 | Supporting Roles                                                                 |
+|------------------------|--------------|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| Abhishek Sebastian     | 550154015    | Logistic Regression, LDA, Ridge Regression (Milestone 2) + Presentation slide preparation (Milestone 5) | Support cross-validation and final presentation (Milestones 4–6)                 |
+| Sree Lakshmi Girisan   | 541010072    | Preprocessing and feature engineering (Milestone 1) + Support model building (Milestone 3) | Support slide preparation and final presentation (Milestones 5–6)                |
+| Deepali Vinayak        | 550317207    | Logistic Regression, LDA, Ridge Regression (Milestone 2) + Support cross-validation (Milestone 4) | Support model building and slide preparation (Milestones 3–5)                    |
+| Valliappan Chidambaram | 540920790    | Stratified cross-validation and evaluation (Milestone 4) + Model building (Milestone 3) | Support earlier modeling tasks and slide preparation (Milestones 2–5)            |
+| Yuanjun He               | 540436235    | Model building (Milestone 3) + Final presentation review and rehearsal (Milestone 6)    | Support slide preparation and team-wide presentation tasks (Milestones 5–6)      |
+
+**4.4.3 Backup Plans:**
+
+*Member unavailability:* If any member is unable to complete their primary task, the supporting role column above ensures immediate coverage.
+*Technical issues:* All code and data are stored in a shared GitHub repository. Daily commits allow any member to continue work if one person’s local environment fails.
+*Time overrun:* We built in two buffer days before the submission deadline. If a milestone slips, the group will conduct an emergency Zoom meeting to reallocate tasks and prioritise the evaluation and final report sections.
+
+### 5. References
+
+1. Australian Bureau of Statistics. (2023, May 8). Socio-Economic Indexes for Areas (SEIFA), Australia, 2021. https://www.abs.gov.au/statistics/people/people-and-communities/socio-economic-indexes-areas-seifa-australia/2021#data-downloads
+
+2. Data SA. (n.d.). Crime statistics. https://data.sa.gov.au/data/dataset/crime-statistics/resource/4a553fc6-71fe-4dac-8096-c29abc269c76
+
+3. Australian Bureau of Statistics. (n.d.). Crime and justice. https://www.abs.gov.au/statistics/people/crime-and-justice
+
+4.The complete Documentation of this project is hosted in Github,download from the link:https://github.com/SreeLakshmiGirisan/Computational-Statistics-_dataset/blob/main/Final-Assignment_cs.html 
+
+**AI Use Statement**
+I acknowledge the use of Gemini (Google) to assist with peer review and cross-verification of our R code logic, including checking analysis structure, identifying possible errors, and suggesting code refinements. The overall project idea, research question, analysis design, and final interpretation were developed by our team. All AI-generated suggestions and refinements were carefully reviewed, edited, and validated by our team to ensure accuracy, originality, and compliance with the assignment’s academic and technical requirements.
