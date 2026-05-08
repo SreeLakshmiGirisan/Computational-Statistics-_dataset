@@ -1,0 +1,634 @@
+---
+title: "Assignment_2"
+output:
+  html_document:
+    code_folding: hide
+  pdf_document:
+    latex_engine: xelatex
+geometry: margin=0.7in
+date: "2026-05-06"
+---
+### 1. Introduction:
+**1.1 Problem Statement**:
+
+In urban planning and public safety, identifying the underlying drivers of criminal activity is essential for efficient resource allocation. While traditional crime reporting provides a historical log of "where" and "when" incidents occur, it often lacks the socio-economic context required to understand "why" certain areas are more vulnerable than others. This project addresses the challenge of predicting specific criminal offence subtypes in South Australia by analyzing the intersection of temporal patterns and socio-economic disadvantage.
+
+**1.2. Research Question**:
+
+To what extent do temporal (calendar and holiday structure), spatial (suburb proximity), and socio-economic (SEIFA 2021 deciles) features improve the conditional prediction of Level 3 offence subtypes given Level 1 and Level 2 offence categories?
+
+**1.3.Motivation and Impact**:
+
+1.Accurate risk detection supports targeted policing, placing patrols where and when they are most needed.
+2.SEIFA–crime links help policymakers design long-term social interventions, not just short-term enforcement.
+3.Better predictions empower communities to improve neighborhood watch, planning, and personal safety.
+
+### 2. Explorative Data Analysis
+
+**Loading the Dataset:**
+The integrated raw dataset, hosted on GitHub, was imported directly into the analysis using the raw CSV link.
+```{r}
+csv_link <- "https://raw.githubusercontent.com/SreeLakshmiGirisan/Computational-Statistics-_dataset/main/Final_Spatial_Crime_SEIFA.csv"
+df <- read.csv(csv_link)
+```
+
+installing all Packages
+
+```{r}
+# List of required packages for the assignment
+packages <- c("readr", "dplyr", "tidyr", "forcats", "ggplot2", 
+              "caret", "nnet", "kknn", "e1071", "ranger", 
+              "recipes", "themis", "lme4", "ggcorrplot","doParallel","randomForest", "glmnet", "MASS","kernlab")
+
+
+
+# Automated installation and loading loop
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
+```{r}
+dim(df)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggcorrplot)
+library(caret)
+
+# 1. Clean column names for easier coding
+colnames(df) <- gsub("\\.", "_", colnames(df)) # Replaces spaces/dots with underscores
+colnames(df) <- gsub("__Incident", "", colnames(df)) # Clean Suburb/Postcode names
+
+# 2. Rename columns to match your specific model plan
+df <- df %>%
+  rename(
+  Level3 = Offence_Level_3_Description,
+   suburb = Suburb_,
+   holiday_flag = IsPublicHoliday_SA
+  )
+```
+
+**SEIFA Correlation Heatmap**
+
+```{r}
+# Select SEIFA variables
+library(dplyr)
+library(ggcorrplot)
+
+# 2. Use dplyr::select to avoid conflicts
+seifa_vars <- df %>% 
+  dplyr::select(sal_adv_dis, sal_dis, sal_Economic_Resources, sal_Employment)
+
+# 3. Compute and plot
+corr_matrix <- cor(seifa_vars, use = "complete.obs")
+
+ggcorrplot(
+  corr_matrix, 
+  lab = TRUE, 
+  title = "Correlation Heatmap of SEIFA Indices",
+  colors = c("#6D9EC1", "white", "#E46726")
+)
+```
+**Bivariate Analysis:**
+
+```{r}
+library(ggplot2)
+
+# List of the four SEIFA variables
+seifa_list <- c("sal_adv_dis", "sal_dis", "sal_Economic_Resources", "sal_Employment")
+
+# Loop to create and save/display 4 separate plots
+for (var in seifa_list) {
+  p <- ggplot(df, aes(x = Level3, y = .data[[var]], fill = Level3)) +
+    geom_boxplot(outlier.size = 0.5) +
+    theme_minimal() +
+    labs(title = paste("Analysis of", var, "by Crime Category"),
+         x = "Crime Category",
+         y = "Index Score") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  
+  print(p)
+}
+```
+
+**Suburb Variance**
+
+**Graph 1: SEIFA Factor - Socio Economic Factor**
+Selection of Top 10 Location in South Australia by total crime Volume (Total_offences > 10)
+```{r}
+# 1. Identify Top 10 suburbs by total crime volume
+top_10_suburbs <- df %>%
+  group_by(suburb) %>%
+  summarise(Total_Offences = n()) %>%
+  arrange(desc(Total_Offences)) %>%
+  head(10) %>%
+  pull(suburb)
+
+# Filter dataset for these specific suburbs
+suburb_data <- df %>% filter(suburb %in% top_10_suburbs)
+
+ggplot(suburb_data, aes(x = reorder(suburb, sal_dis, median), y = sal_dis, fill = suburb)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Socioeconomic Variance: Top 10 High-Crime Suburbs",
+       subtitle = "Justification for Hierarchical Intercepts (Week 13)",
+       x = "Suburb", y = "Index of Relative Disadvantage (sal_dis)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+Shows that "High Crime" does not always mean "High Disadvantage" across all locations.
+
+**Graph 2: Temporal Factor (Weekend vs. Weekday by Suburb)**
+```{r}
+
+ggplot(suburb_data, aes(x = suburb, fill = factor(IsWeekend))) +
+  geom_bar(position = "fill") + # Shows proportion to compare suburbs fairly
+  theme_minimal() +
+  scale_fill_manual(values = c("steelblue", "orange"), 
+                    labels = c("Weekday", "Weekend"), name = "Time of Week") +
+  labs(title = "Crime Timing: Weekday vs. Weekend Proportions",
+       subtitle = "Top 10 Suburbs Analysis",
+       x = "Suburb", y = "Proportion of Crimes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Identifies if suburbs like CBD-areas have higher weekend proportions compared to residential suburbs.
+
+**Graph 3: Crime Type Composition by Suburb (Spatial/Categorical Mix)**
+```{r}
+
+ggplot(suburb_data, aes(x = suburb, fill = Offence_Level_1_Description)) +
+  geom_bar(position = "stack") + 
+  theme_minimal() +
+  labs(title = "Crime Composition in Top 10 Suburbs",
+       subtitle = "Spatial Distribution of Offence Types",
+       x = "Suburb", y = "Number of Offences", fill = "Crime Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The suburb "layer" is a significant driver of crime type of different Locations 
+
+```{r}
+# Count missing values per column
+colSums(is.na(df))
+```
+
+### 3. Model Implementation Details
+
+**Preprocessing and splitting strategy**
+
+**Missing SEIFA values**: The dataset has 76,598 rows in total, and 873 rows contain missing values in the SEIFA variables. Calculation: 873÷76598×100≈1.14%. This is a very small percentage, so removing these rows is unlikely to significantly affect the overall analysis. Reason: Keeping incomplete SEIFA records may create problems during modelling and make inaccurate results. Removing them makes the dataset cleaner and easier to work with.
+```{r}
+# Remove rows where SEIFA variables are NA 
+# We use sal_adv_dis as the reference since it has the 873 missing values
+df_cleaned <- df %>% 
+  filter(!is.na(sal_adv_dis))
+
+# Verify the new dimensions
+nrow(df_cleaned)
+colSums(is.na(df_cleaned))
+dim(df_cleaned)
+```
+
+**Outlier handling**: Numeric variables such as offence count will be checked using the IQR rule. Extreme values will be removed or treated before modelling to reduce distortion.
+
+```{r}
+# Define the IQR for Offence_count
+Q1 <- quantile(df_cleaned$Offence_count, .25)
+Q3 <- quantile(df_cleaned$Offence_count, .75)
+IQR_val <- Q3 - Q1
+
+# Filter out extreme outliers
+df_final <- df_cleaned %>%
+  filter(Offence_count >= (Q1 - 1.5 * IQR_val) & 
+         Offence_count <= (Q3 + 1.5 * IQR_val))
+dim(df_cleaned)
+
+
+summary(df_cleaned$Offence_count)
+
+# Check the bounds 
+cat("Lower Bound:", Q1 - 1.5 * IQR_val, "Upper Bound:", Q3 + 1.5 * IQR_val)
+```
+
+1st Quartile, Median, and 3rd Quartile are all 1.000, So IQR is 0 which implies no rows where deleted.
+
+**Check for any other redundant data**: If there are any repeated rows in the dataset, they should also be removed to avoid errors or duplication in the analysis.
+
+```{r}
+# Remove redundant/repeated rows 
+df_cleaned <- df_cleaned %>% 
+  distinct()
+dim(df_cleaned)
+```
+**Featuring engineering**
+
+A new binary variable will be created from Offence.Level.1.Description. 0 = offences against property 1 = offences against person This simplifies the offence category into a form that can be used easily in classification models. Reason: Converting the offence type into a binary feature helps the model distinguish between broad crime groups more clearly and reduces complexity in the data.
+
+```{r}
+# Create binary offence category 
+df_cleaned <- df_cleaned %>%
+  mutate(offence_binary = ifelse(grepl("PROPERTY", Offence_Level_1_Description), 0, 1))
+
+# Check the distribution
+table(df_cleaned$offence_binary)
+
+# Use dplyr:: explicitly to avoid the "unused arguments" error
+df_cleaned %>% 
+  dplyr::select(any_of(c("Offence_Level_1_Description", "offence_binary"))) %>% 
+  head(5)
+```
+
+```{r}
+str(df_cleaned)
+```
+
+**Datatype Conversion**
+
+```{r}
+library(dplyr)
+library(caret)
+
+# Convert character and integer categories into Factors
+df_final <- df_cleaned %>%
+  mutate(
+    # Target Variable
+    Level3 = as.factor(Level3),
+    # Categorical Predictors
+    suburb = as.factor(suburb),
+    Postcode_ = as.factor(Postcode_),
+    Offence_Level_1_Description = as.factor(Offence_Level_1_Description),
+    Offence_Level_2_Description = as.factor(Offence_Level_2_Description),
+    Cal_Month = as.factor(Cal_Month),
+    Cal_DayOfWeek = as.factor(Cal_DayOfWeek),
+    Season_SH = as.factor(Season_SH),
+    IsWeekend = as.factor(IsWeekend),
+    holiday_flag = as.factor(holiday_flag)
+  )
+```
+
+
+**Splitting of Data**
+split the data to ensure models are trained and tested on separate sets.
+```{r}
+set.seed(5003) # For reproducibility
+
+# Create index for 80% training data
+trainIndex <- createDataPartition(df_final$Level3, p = 0.8, list = FALSE)
+
+# Create the primary split
+train_full <- df_final[trainIndex, ]
+test_set   <- df_final[-trainIndex, ]
+
+cat("Full Training Set Rows:", nrow(train_full), "\n")
+cat("Final Test Set Rows:", nrow(test_set), "\n")
+```
+**Sub Sampling**
+```{r}
+# 3. Creating the "Efficiency Subset" (The 10% Stratified Sample)
+set.seed(5003)
+
+# Stratified sampling ensures every one of the 28 Level3 categories 
+# is represented proportionally in the subset.
+train_mini <- train_full %>%
+  group_by(Level3) %>%
+  sample_frac(0.10) %>% 
+  ungroup()
+
+# Verification: This should equal 28
+num_categories <- length(unique(train_mini$Level3))
+
+cat("Efficiency Subset Rows:", nrow(train_mini), "\n")
+cat("Number of Crime Categories included:", num_categories, "\n")
+
+# If you want to see exactly how many of each crime are in your subset:
+table(train_mini$Level3)
+```
+**Classification models fitted**
+
+**Hierarchical models for finding the effect of each factors **
+```{r}
+# 1. Reset environment and stop parallel processing for stability
+foreach::registerDoSEQ()
+stopImplicitCluster()
+gc()
+
+# 2. Define formulas 
+f1 <- as.formula("Level3 ~ offence_binary + Offence_Level_2_Description")
+f2 <- as.formula("Level3 ~ offence_binary + Offence_Level_2_Description + sal_adv_dis + sal_dis + sal_Economic_Resources + sal_Employment")
+f3 <- as.formula("Level3 ~ offence_binary + Offence_Level_2_Description + sal_adv_dis + sal_dis + sal_Economic_Resources + sal_Employment + Cal_Month + Cal_DayOfWeek + holiday_flag")
+# Using Postcode_ (307 levels) instead of suburb (945 levels) to prevent memory crash
+f4 <- as.formula("Level3 ~ offence_binary + Offence_Level_2_Description + sal_adv_dis + sal_dis + sal_Economic_Resources + sal_Employment + Cal_Month + Cal_DayOfWeek + holiday_flag + Postcode_")
+
+# 3. Use 3-fold CV (Required because some classes like 'Murder' have very few rows)
+train_control <- trainControl(method = "cv", number = 3, allowParallel = FALSE)
+
+# 4. Fit the Models
+set.seed(5003)
+
+
+```
+
+**KNN**
+
+```{r}
+# Define Tuning Grid for KNN: Searching for the best 'k' (number of neighbors)
+knn_grid <- expand.grid(k = seq(1, 21, by = 2))
+
+set.seed(5003)
+
+
+print("Fitting KNN Model 2")
+knn_m2 <- train(f2, data = train_mini, 
+                method = "knn", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"),
+                tuneGrid = knn_grid)
+
+print("Fitting KNN Model 3 ")
+knn_m3 <- train(f3, data = train_mini, 
+                method = "knn", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"),
+                tuneGrid = knn_grid)
+
+# Plot KNN results to show hyperparameter tuning for Section 3.4
+plot(knn_m2)
+knn_m2$results$Accuracy
+knn_m3$results$Accuracy
+```
+**random Forest**
+
+```{r}
+# Define Tuning Grid for RF: Searching for best 'mtry'
+# 1. Clean memory
+gc()
+
+# 2. Optimized RF Formulas (Stick to Model 1 and Model 2 for speed)
+# f1: Core, f2: SEIFA
+set.seed(5003)
+
+print("Fitting Fast Random Forest Model 1...")
+# We use tuneLength = 1 to pick one value and finish fast
+rf_m1 <- train(f1, data = train_mini, 
+               method = "rf", 
+               trControl = train_control, 
+               ntree = 50,           # Fewer trees for speed
+               tuneLength = 1)       # No extensive grid search
+
+print("Fitting Fast Random Forest Model 2...")
+rf_m2 <- train(f2, data = train_mini, 
+               method = "rf", 
+               trControl = train_control, 
+               ntree = 50, 
+               tuneLength = 1,
+               importance = TRUE)    # Keep importance for your report
+print("Fitting Fast Random Forest Model 3...")
+rf_m3 <- train(f3, data = train_mini, 
+               method = "rf", 
+               trControl = train_control, 
+               ntree = 50, 
+               tuneLength = 1,
+               importance = TRUE) 
+print("Fitting Fast Random Forest Model 4...")
+rf_m4 <- train(f4, data = train_mini, 
+               method = "rf", 
+               trControl = train_control, 
+               ntree = 50, 
+               tuneLength = 1,
+               importance = TRUE) 
+
+# Check accuracy quickly
+rf_m1$results$Accuracy
+rf_m2$results$Accuracy
+rf_m3$results$Accuracy
+rf_m4$results$Accuracy
+```
+
+```{r}
+
+# Define a simpler Tuning Grid for speed
+svm_grid <- expand.grid(C = c(0.1, 1)) 
+
+# Model 1: Core
+print("Starting SVM Model 1...")
+svm_m1 <- train(f1, 
+                data = train_mini, 
+                method = "svmLinear", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"), # Caret handles scaling
+                tuneGrid = svm_grid)
+
+# Model 2: Core + SEIFA
+print("Starting SVM Model 2...")
+svm_m2 <- train(f2, 
+                data = train_mini, 
+                method = "svmLinear", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"), 
+                tuneGrid = svm_grid)
+
+# Model 3: Core + SEIFA + Time
+print("Starting SVM Model 3...")
+svm_m3 <- train(f3, 
+                data = train_mini, 
+                method = "svmLinear", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"), 
+                tuneGrid = svm_grid)
+
+# Model 4: Full (Spatial)
+# Warning: Using factors with many levels (Postcode) inside SVM is very slow
+print("Starting SVM Model 4...")
+svm_m4 <- train(f4, 
+                data = train_mini, 
+                method = "svmLinear", 
+                trControl = train_control, 
+                preProcess = c("center", "scale"), 
+                tuneGrid = svm_grid)
+
+```
+```{r}
+svm_m1$results$Accuracy
+svm_m2$results$Accuracy
+svm_m3$results$Accuracy
+svm_m4$results$Accuracy
+```
+
+**logistic Regression**
+```{r}
+print("Fitting Logistic Models...")
+set.seed(5003)
+log_m1 <- train(f1, data = train_mini, method = "multinom", trControl = train_control, trace = FALSE, MaxNWts = 5000)
+log_m2 <- train(f2, data = train_mini, method = "multinom", trControl = train_control, trace = FALSE, MaxNWts = 5000)
+log_m3 <- train(f3, data = train_mini, method = "multinom", trControl = train_control, trace = FALSE, MaxNWts = 5000)
+```
+**ridge regression**
+```{r}
+# Create the stable dataset by removing categories with < 10 rows
+train_mini_stable <- train_mini %>%
+  group_by(Level3) %>%
+  filter(n() >= 10) %>%
+  ungroup() %>%
+  mutate(Level3 = droplevels(Level3))
+
+# Verify it: This count should be higher than 1 for all categories
+table(train_mini_stable$Level3)
+```
+**ridge results**
+```{r}
+print("Fitting Ridge Models (Stable Dataset)...")
+ridge_grid <- expand.grid(alpha = 0, lambda = seq(0.001, 0.1, by = 0.02))
+
+set.seed(5003)
+# IMPORTANT: data = train_mini_stable
+ridge_m1 <- train(f1, data = train_mini_stable, method = "glmnet", family = "multinomial", 
+                  trControl = train_control, tuneGrid = ridge_grid)
+
+ridge_m2 <- train(f2, data = train_mini_stable, method = "glmnet", family = "multinomial", 
+                  trControl = train_control, tuneGrid = ridge_grid)
+
+ridge_m3 <- train(f3, data = train_mini_stable, method = "glmnet", family = "multinomial", 
+                  trControl = train_control, tuneGrid = ridge_grid)
+
+# Display Ridge Accuracies
+cat("Ridge Accuracies (M1, M2, M3):", 
+    max(ridge_m1$results$Accuracy), 
+    max(ridge_m2$results$Accuracy), 
+    max(ridge_m3$results$Accuracy), "\n")
+```
+
+
+**results**
+```{r}
+cat("Logistic Accuracies:", log_m1$results$Accuracy[1], log_m2$results$Accuracy[1], log_m3$results$Accuracy[1], "\n")
+cat("Ridge Accuracies:", max(ridge_m1$results$Accuracy), max(ridge_m2$results$Accuracy), max(ridge_m3$results$Accuracy), "\n")
+```
+**total results**
+```{r}
+# Function to safely extract accuracy
+get_acc <- function(model_obj_name) {
+  # We check if the object exists in the global environment by name
+  if (!exists(model_obj_name)) {
+    return(NA)
+  } else {
+    model_obj <- get(model_obj_name)
+    # Extract the highest accuracy from the tuning results
+    return(round(max(model_obj$results$Accuracy, na.rm = TRUE), 4))
+  }
+}
+
+# Create the final comparison dataframe
+# Every column now has exactly 5 entries to match the 5 Algorithms
+final_performance_table <- data.frame(
+  Algorithm = c("Logistic Regression", "Ridge Regression", "KNN", "Random Forest", "SVM"),
+  
+  Model_1_Base = c(
+    get_acc("log_m1"), get_acc("ridge_m1"), get_acc("knn_m1"), get_acc("rf_m1"), get_acc("svm_m1")
+  ),
+  
+  Model_2_SEIFA = c(
+    get_acc("log_m2"), get_acc("ridge_m2"), get_acc("knn_m2"), get_acc("rf_m2"), get_acc("svm_m2")
+  ),
+  
+  Model_3_Time = c(
+    get_acc("log_m3"), get_acc("ridge_m3"), get_acc("knn_m3"), get_acc("rf_m3"), get_acc("svm_m3")
+  ),
+  
+  Model_4_Spatial = c(
+    get_acc("log_m4"), get_acc("ridge_m4"), get_acc("knn_m4"), get_acc("rf_m4"), get_acc("svm_m4")
+  )
+)
+
+# Replace NA with "nill" for the final display
+final_performance_table[final_performance_table == "NaN" | is.na(final_performance_table)] <- "nill"
+
+# Print the table to the console
+print(final_performance_table)
+
+# For a pretty table in your R Markdown report
+if (requireNamespace("knitr", quietly = TRUE)) {
+  knitr::kable(final_performance_table, caption = "Comparison of Model Accuracies across All Specifications")
+
+}
+```
+
+
+**Hyperparameter tuning**
+**Tuning Random Forest (Best for Model 4)**
+```{r}
+# Define a more detailed grid for mtry
+# We test more values than before to find the "sweet spot"
+rf_tune_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10))
+
+set.seed(5003)
+print("Tuning Final Random Forest...")
+
+# We use Model 4 because it has the most information
+final_rf_model <- train(f4, 
+                        data = train_mini, 
+                        method = "rf", 
+                        trControl = train_control, 
+                        tuneGrid = rf_tune_grid,
+                        ntree = 100,      # Increased trees for better stability
+                        importance = TRUE)
+
+# View the tuning results
+plot(final_rf_model)
+final_rf_model$bestTune
+```
+
+**Tuning KNN (Best Accuracy in Model 2)**
+```{r}
+# Expanded grid for k
+knn_tune_grid <- expand.grid(k = seq(1, 31, by = 2))
+
+set.seed(5003)
+print("Tuning Final KNN...")
+
+final_knn_model <- train(f2, 
+                         data = train_mini, 
+                         method = "knn", 
+                         trControl = train_control, 
+                         preProcess = c("center", "scale"),
+                         tuneGrid = knn_tune_grid)
+
+# View the tuning results
+plot(final_knn_model)
+final_knn_model$bestTune
+```
+
+
+
+
+
+### 4. Model Evaluation & Selection
+
+```{r}
+# 1. Make predictions on the unseen test data
+final_preds <- predict(final_rf_model, newdata = test_set)
+
+# 2. Generate the Confusion Matrix
+conf_matrix <- confusionMatrix(final_preds, test_set$Level3)
+
+# 3. View the Final Accuracy and Kappa
+print(conf_matrix$overall['Accuracy'])
+print(conf_matrix$overall['Kappa'])
+
+# 4. See which crimes it identifies best
+# Look for 'Sensitivity' and 'Specificity' per class
+print(conf_matrix$byClass)
+```
+
+### 5. Conclusion & Insights
+### 6. Reference
+
+
+

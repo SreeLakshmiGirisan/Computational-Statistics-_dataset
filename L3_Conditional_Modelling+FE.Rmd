@@ -1,0 +1,1015 @@
+---
+title: "Conditional Prediction of L3 Offence Subtypes given L1 + L2"
+subtitle: "With Spatial Feature Engineering — k-means Crime Zones"
+author: "CompStat Project 2 — W06G03"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 6, dpi = 110,
+  cache = TRUE,
+  cache.lazy = FALSE
+)
+options(scipen = 999)
+```
+
+# Section 0 — Plan & risk register {#plan}
+
+The research question is:
+
+> *To what extent do temporal (calendar/holiday), spatial (suburb), and
+> socio-economic (SEIFA decile) features improve conditional prediction of L3
+> offence subtypes, **given** L1 and L2?*
+
+**Key difference from the base version:** `Suburb_Incident` is never used
+directly as a model feature. Instead, all **965 raw suburbs** are individually
+clustered into a 10-level factor `Zone_km` using k-means on suburb-level
+density and SEIFA features. Every suburb — even one with 3 rows — gets its
+own zone assignment based on its actual SEIFA deciles, not a generic
+`"OTHER"` bucket. This eliminates the unseen-level NA risk, reduces the
+Spatial multinomial from ~9,828 weights to 280, and cuts fit time from
+**~35 min to ~2 min** per block.
+
+## Data quirks that motivate defensive coding
+
+* Column names contain spaces/hyphens — renamed to `Suburb_Incident`, `L1`,
+  `L2`, `L3` immediately on load.
+* All 965 raw suburbs are retained — **no `"OTHER"` collapsing** in this
+  file because `Suburb_Incident` is only a grouping key for zone derivation,
+  never a direct model predictor.
+* SEIFA missing for ~873 rows → imputed by suburb median (on the original
+  965 suburb groups), then column-wide median fallback.
+* Duplicate rows are **kept** — they are real repeated incidents.
+* Class imbalance (1,432:1) is **not** corrected — macro-averaged F1 is the
+  primary metric.
+* `MaxNWts = 50000` in `multinom` to accommodate 28 classes × up to
+  ~20 predictors in the Full block.
+
+# 1. Setup & data preparation
+
+## 1.1 Packages
+
+```{r packages}
+needed <- c("nnet","rpart","rpart.plot","ranger","class",
+            "caret","pscl","ggplot2","dplyr","tidyr","scales")
+
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(nnet);  library(rpart); library(rpart.plot)
+  library(ranger); library(class); library(caret)
+  library(pscl);  library(ggplot2); library(dplyr)
+  library(tidyr); library(scales)
+})
+
+set.seed(42)
+```
+
+## 1.2 Load CSV and drop redundant / leaky columns
+
+```{r load}
+data_path <- "../Final_Spatial_Crime_SEIFA.csv"
+if (!file.exists(data_path)) data_path <- "Final_Spatial_Crime_SEIFA.csv"
+stopifnot(file.exists(data_path))
+
+raw <- read.csv(data_path, stringsAsFactors = FALSE,
+                check.names = FALSE, na.strings = c("","NA"))
+cat("Rows loaded:", nrow(raw), "| Columns:", ncol(raw), "\n")
+
+drop_cols <- c("Reported Date","Postcode - Incident","salcode",
+               "Offence count","Cal_DayOfMonth","IsWeekend")
+df <- raw[, setdiff(names(raw), drop_cols)]
+
+rename_map <- c("Suburb - Incident"           = "Suburb_Incident",
+                "Offence Level 1 Description" = "L1",
+                "Offence Level 2 Description" = "L2",
+                "Offence Level 3 Description" = "L3")
+for (old in names(rename_map))
+  if (old %in% names(df)) names(df)[names(df) == old] <- rename_map[[old]]
+
+cat("Columns retained:\n"); print(names(df))
+```
+
+## 1.3 Suburb diagnostic — all 965 suburbs retained
+
+In this file `Suburb_Incident` is **only a grouping key** for k-means zone
+derivation (Section 1.8). It is never passed directly to a model formula, so
+the unseen-level NA risk that forces collapsing in the base version does not
+apply here. All 965 raw suburbs are kept as-is; each receives its own zone
+assignment based on its individual SEIFA profile.
+
+```{r suburb_diag}
+suburb_counts <- sort(table(df$Suburb_Incident), decreasing = TRUE)
+cat("Total raw suburbs        :", length(suburb_counts), "\n")
+cat("Suburbs with >= 30 obs   :", sum(suburb_counts >= 30), "\n")
+cat("Suburbs with  < 30 obs   :", sum(suburb_counts <  30),
+    " (all get individual Zone_km — no OTHER bucket)\n")
+cat("\nTop 5 suburbs by obs count:\n")
+print(head(suburb_counts, 5))
+cat("\nBottom 5 suburbs by obs count:\n")
+print(tail(suburb_counts, 5))
+```
+
+## 1.4 Impute missing SEIFA values
+
+```{r impute_seifa}
+seifa_cols <- c("sal_adv_dis","sal_dis","sal_Economic_Resources","sal_Employment")
+
+cat("Missing per SEIFA column (before):\n")
+print(sapply(df[seifa_cols], function(x) sum(is.na(x))))
+
+df <- df %>%
+  group_by(Suburb_Incident) %>%
+  mutate(across(all_of(seifa_cols),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x))) %>%
+  ungroup()
+
+for (cc in seifa_cols) {
+  df[[cc]][is.na(df[[cc]])] <- median(df[[cc]], na.rm = TRUE)
+}
+
+cat("Missing per SEIFA column (after) :\n")
+print(sapply(df[seifa_cols], function(x) sum(is.na(x))))
+```
+
+## 1.5 Convert character columns to factors and tidy types
+
+```{r factorise}
+for (cc in names(df)[sapply(df, is.character)]) df[[cc]] <- factor(df[[cc]])
+for (cc in c("IsPublicHoliday_SA","IsLongWeekend","IsSchoolHoliday_SA"))
+  if (cc %in% names(df)) df[[cc]] <- as.integer(df[[cc]])
+df$Cal_Month <- as.integer(df$Cal_Month)
+
+cat("Final structure:\n"); str(df)
+
+l3_tab <- sort(table(df$L3), decreasing = TRUE)
+cat("\nClass distribution — top 5 / bottom 5:\n")
+print(head(l3_tab, 5)); cat("...\n"); print(tail(l3_tab, 5))
+cat(sprintf("Imbalance ratio (max/min): %.0f : 1\n", max(l3_tab)/min(l3_tab)))
+```
+
+## 1.6 Stratified 80/20 split
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(df$L3, p = 0.8, list = FALSE)
+train <- df[train_idx, ]
+test  <- df[-train_idx, ]
+
+for (cc in names(train)) {
+  if (is.factor(train[[cc]]))
+    test[[cc]] <- factor(test[[cc]], levels = levels(train[[cc]]))
+}
+
+cat("Train:", nrow(train), "| Test:", nrow(test), "\n")
+cat("L3 levels — train:", nlevels(train$L3), "test:", nlevels(test$L3), "\n")
+```
+
+## 1.7 Scaled numeric matrix for k-NN
+
+```{r scale_numeric}
+num_cols <- c("Cal_Month", seifa_cols)
+mu_train <- sapply(train[num_cols], mean)
+sd_train <- sapply(train[num_cols], sd); sd_train[sd_train == 0] <- 1
+scaled_train_num <- scale(train[num_cols], center = mu_train, scale = sd_train)
+scaled_test_num  <- scale(test [num_cols], center = mu_train, scale = sd_train)
+cat("Scaled numeric matrix dims (train):", dim(scaled_train_num), "\n")
+```
+
+---
+
+## 1.8 Feature Engineering — k-means Spatial Zones {#fe-zones}
+
+### Methodology
+
+Fitting a multinomial logit on all 965 raw suburb levels would require
+approximately `28 classes × 965 dummies = 27 020 weights` and create severe
+unseen-level NA risk at prediction time. Rather than discarding spatial
+information or collapsing rare suburbs into a meaningless `"OTHER"` bucket,
+we **engineer a 10-level factor `Zone_km`** by clustering **all 965 suburbs
+individually** in a 4-dimensional space that captures both *crime density* and
+*socio-economic character*:
+
+| Clustering feature | Rationale |
+|---|---|
+| `log(n)` — log of row-count per suburb | Proxy for urban density / population. Log-scale prevents megalopolises (Adelaide CBD, 3405 rows) from dominating |
+| `sal_dis` — SEIFA Disadvantage decile | Socio-economic deprivation gradient |
+| `sal_Employment` — Employment decile | Labour-market stress, known predictor of property crime |
+| `sal_Economic_Resources` — Economic resources decile | Wealth/resources gradient, complements disadvantage |
+
+Every suburb — even one with only 3 rows — gets its **own zone assignment**
+based on its actual SEIFA deciles. A rare but affluent suburb (e.g. `MINTARO`,
+5 rows, SEIFA dis = 10) correctly lands in the affluent zone rather than a
+generic disadvantaged bucket. All four features are **z-score scaled** before
+k-means so no dimension dominates by scale. We use **k = 10** clusters with
+`nstart = 25` random restarts. The clustering is performed on the **full
+dataset before the train/test split**, so zone labels are a static property
+of each suburb — not derived from `L3` — making the join to train and test
+correct and leakage-free.
+
+The result: Spatial multinomial drops from ~27 020 weights (raw suburbs) or
+~9 828 weights (after OTHER collapsing) to just
+`28 classes × 10 dummies = 280 weights` — **fit time ~2 min instead of
+~35 min**, with every suburb's socio-economic character preserved.
+
+```{r fe_kmeans}
+# Build suburb-level aggregate on ALL 965 raw suburbs (no OTHER collapsing)
+# df$Suburb_Incident still holds original suburb names at this point
+suburb_agg <- df %>%
+  group_by(Suburb_Incident) %>%
+  summarise(
+    suburb_n  = n(),
+    log_n     = log(n()),
+    dis       = mean(sal_dis,                na.rm = TRUE),
+    emp       = mean(sal_Employment,         na.rm = TRUE),
+    econ      = mean(sal_Economic_Resources, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+cat("Suburbs entering k-means:", nrow(suburb_agg), "\n")
+cat("Any NA in clustering features:\n")
+print(colSums(is.na(suburb_agg[, c("log_n","dis","emp","econ")])))
+
+# k-means on scaled 4-feature space (all 965 suburbs)
+set.seed(42)
+km_fit <- kmeans(scale(suburb_agg[, c("log_n","dis","emp","econ")]),
+                 centers = 10, nstart = 25, iter.max = 100)
+suburb_agg$Zone_km <- paste0("Zone_", km_fit$cluster)
+
+# Show how rare suburbs (< 30 obs) were distributed across zones
+rare_zone_dist <- suburb_agg %>%
+  mutate(rare = suburb_n < 30) %>%
+  count(rare, Zone_km) %>%
+  arrange(Zone_km)
+cat("\nZone distribution of rare suburbs (n < 30) vs common suburbs:\n")
+print(as.data.frame(rare_zone_dist))
+
+# Join zone label back to df, train, test
+df    <- df    %>% left_join(suburb_agg[, c("Suburb_Incident","Zone_km")],
+                              by = "Suburb_Incident")
+train <- train %>% left_join(suburb_agg[, c("Suburb_Incident","Zone_km")],
+                              by = "Suburb_Incident")
+test  <- test  %>% left_join(suburb_agg[, c("Suburb_Incident","Zone_km")],
+                              by = "Suburb_Incident")
+
+# Factorise Zone_km and sync levels across train/test
+all_zones     <- sort(unique(df$Zone_km))
+df$Zone_km    <- factor(df$Zone_km,    levels = all_zones)
+train$Zone_km <- factor(train$Zone_km, levels = all_zones)
+test$Zone_km  <- factor(test$Zone_km,  levels = all_zones)
+
+cat("\nZone_km levels:", nlevels(df$Zone_km), "\n")
+cat("NA in Zone_km — df:", sum(is.na(df$Zone_km)),
+    " | train:", sum(is.na(train$Zone_km)),
+    " | test:",  sum(is.na(test$Zone_km)), "\n")
+cat("Total rows accounted for:", sum(table(df$Zone_km)), "/", nrow(df), "\n")
+```
+
+### Zone membership table — suburbs per zone, SEIFA profile, sample suburbs
+
+```{r fe_zone_table}
+# Per-zone summary with dynamic plain-English labels
+zone_summary <- suburb_agg %>%
+  group_by(Zone_km) %>%
+  summarise(
+    n_suburbs  = n(),
+    total_obs  = sum(suburb_n),
+    median_obs = round(median(suburb_n)),
+    avg_dis    = round(mean(dis),  1),
+    avg_emp    = round(mean(emp),  1),
+    avg_econ   = round(mean(econ), 1),
+    .groups    = "drop"
+  ) %>%
+  arrange(Zone_km)
+
+# Dynamic label: classify each zone on volume (High/Med/Low) and SEIFA (Adv/Mid/Disadv)
+zone_summary <- zone_summary %>%
+  mutate(
+    vol_label  = case_when(
+      total_obs >= quantile(total_obs, 0.67) ~ "High-volume",
+      total_obs >= quantile(total_obs, 0.33) ~ "Medium-volume",
+      TRUE                                   ~ "Low-volume"),
+    seifa_label = case_when(
+      avg_dis >= 7  ~ "advantaged",
+      avg_dis >= 4  ~ "mid-SEIFA",
+      TRUE          ~ "disadvantaged"),
+    emp_label   = case_when(
+      avg_emp >= 7  ~ "high-employment",
+      avg_emp >= 4  ~ "moderate-employment",
+      TRUE          ~ "low-employment"),
+    Character = paste0(vol_label, ", ", seifa_label, ", ", emp_label)
+  ) %>%
+  select(-vol_label, -seifa_label, -emp_label)
+
+cat("=== Zone membership summary (all 965 suburbs, no OTHER bucket) ===\n")
+print(as.data.frame(zone_summary), row.names = FALSE)
+```
+
+### Sample suburbs from each zone (top 5 by observation count)
+
+```{r fe_zone_samples}
+zone_top5 <- suburb_agg %>%
+  group_by(Zone_km) %>%
+  arrange(Zone_km, desc(suburb_n)) %>%
+  slice_head(n = 5) %>%
+  select(Zone_km, Suburb_Incident, suburb_n, dis, emp, econ) %>%
+  rename(n_obs = suburb_n,
+         SEIFA_dis = dis, SEIFA_emp = emp, SEIFA_econ = econ) %>%
+  ungroup()
+
+cat("=== Top 5 suburbs per zone ===\n")
+print(as.data.frame(zone_top5), row.names = FALSE)
+```
+
+### Zone size visualisation
+
+```{r fe_zone_plot, fig.height=5}
+zone_plot_df <- zone_summary %>%
+  mutate(Zone_km = factor(Zone_km, levels = paste0("Zone_", 1:10)),
+         label   = paste0(Zone_km, "\n(", n_suburbs, " suburbs)"))
+
+ggplot(zone_plot_df,
+       aes(x = reorder(label, total_obs), y = total_obs,
+           fill = avg_dis)) +
+  geom_col(colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = scales::comma(total_obs)),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_fill_gradient(low = "#d73027", high = "#1a9850",
+                      name = "Avg SEIFA\nDisadvantage\n(1=worst, 10=best)") +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "k-means Crime Zones: total observations and SEIFA profile",
+       subtitle = "Colour = average Disadvantage decile (green = advantaged)",
+       x = NULL, y = "Total incident rows") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+### SEIFA profile heatmap across zones
+
+```{r fe_seifa_heatmap, fig.height=4.5}
+hm_df <- zone_summary %>%
+  select(Zone_km, avg_dis, avg_emp, avg_econ) %>%
+  pivot_longer(-Zone_km, names_to = "Metric", values_to = "Decile") %>%
+  mutate(Metric = recode(Metric,
+    avg_dis  = "Disadvantage",
+    avg_emp  = "Employment",
+    avg_econ = "Economic Resources"),
+    Zone_km = factor(Zone_km, levels = paste0("Zone_", 1:10)))
+
+ggplot(hm_df, aes(x = Metric, y = Zone_km, fill = Decile)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = Decile), size = 3.5, fontface = "bold") +
+  scale_fill_gradient(low = "#d73027", high = "#1a9850",
+                      limits = c(1, 10),
+                      name = "Decile\n(1=worst\n10=best)") +
+  labs(title    = "SEIFA profile heatmap by Zone",
+       subtitle = "Each cell = average decile for suburbs in that zone",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right",
+        axis.text.y = element_text(size = 9))
+```
+
+---
+
+# 0.1 Expected runtime (with 10-zone FE) {#runtime}
+
+```{r runtime_warning, cache=FALSE}
+n_cores <- parallel::detectCores()
+cat("── Runtime forecast with Zone_km (10 levels) ────────────────────\n")
+cat(sprintf("  CPU cores available : %d\n", n_cores))
+cat("\n")
+cat("  Model              Blocks               Est. time\n")
+cat("  -------------------------------------------------------\n")
+cat("  Multinomial Logit  Baseline/Temporal/SEIFA  ~3 min each\n")
+cat("  Multinomial Logit  Spatial + Full           ~2–4 min each  (was 30–45)\n")
+cat("  Classification Tree all 5 blocks            ~3–4 min total\n")
+cat("  k-NN (k=5)          all 5 blocks            ~3–5 min total\n")
+cat(sprintf("  Random Forest      all 5 blocks (%d threads)   ~2–3 min total\n", n_cores))
+cat("  -------------------------------------------------------\n")
+cat("  TOTAL (first knit)                           ~20–25 min\n")
+cat("  TOTAL (re-knit, cache hits)                  < 1 min\n")
+cat("────────────────────────────────────────────────────────────────\n")
+```
+
+# 2. Feature blocks
+
+```{r blocks}
+# Zone_km replaces Suburb_Incident in Spatial and Full blocks.
+# k-NN can now INCLUDE Zone_km (only 10 levels → 9 dummies, cheap).
+blocks <- list(
+  Baseline = list(
+    formula  = L3 ~ L1 + L2,
+    knn_vars = c("L1","L2")
+  ),
+  Temporal = list(
+    formula  = L3 ~ L1 + L2 + Cal_Month + Cal_DayOfWeek + Season_SH +
+                    IsPublicHoliday_SA + IsLongWeekend + IsSchoolHoliday_SA,
+    knn_vars = c("L1","L2","Cal_Month","Cal_DayOfWeek","Season_SH",
+                 "IsPublicHoliday_SA","IsLongWeekend","IsSchoolHoliday_SA")
+  ),
+  Spatial  = list(
+    formula  = L3 ~ L1 + L2 + Zone_km,          # 10-level k-means zone
+    knn_vars = c("L1","L2","Zone_km")            # 9 dummies — cheap for k-NN
+  ),
+  SEIFA    = list(
+    formula  = L3 ~ L1 + L2 + sal_adv_dis + sal_dis +
+                    sal_Economic_Resources + sal_Employment,
+    knn_vars = c("L1","L2","sal_adv_dis","sal_dis",
+                 "sal_Economic_Resources","sal_Employment")
+  ),
+  Full     = list(
+    formula  = L3 ~ L1 + L2 + Cal_Month + Cal_DayOfWeek + Season_SH +
+                    IsPublicHoliday_SA + IsLongWeekend + IsSchoolHoliday_SA +
+                    Zone_km +
+                    sal_adv_dis + sal_dis + sal_Economic_Resources + sal_Employment,
+    knn_vars = c("L1","L2","Cal_Month","Cal_DayOfWeek","Season_SH",
+                 "IsPublicHoliday_SA","IsLongWeekend","IsSchoolHoliday_SA",
+                 "Zone_km",
+                 "sal_adv_dis","sal_dis","sal_Economic_Resources","sal_Employment")
+  )
+)
+block_order <- c("Baseline","Temporal","Spatial","SEIFA","Full")
+```
+
+# 3. Model fitting
+
+## 3.1 Helpers
+
+```{r helpers}
+macro_metrics <- function(pred, truth) {
+  pred <- factor(pred, levels = levels(truth))
+  cm   <- caret::confusionMatrix(pred, truth, mode = "prec_recall")
+  bc   <- as.data.frame(cm$byClass)
+
+  # Class counts from the test truth vector (used for weighted F1)
+  class_counts <- as.integer(table(truth))
+
+  # Weighted F1: NA F1 (class never predicted) treated as 0 — standard sklearn behaviour
+  f1_vals     <- ifelse(is.na(bc$F1), 0, bc$F1)
+  weighted_f1 <- sum(f1_vals * class_counts) / sum(class_counts)
+
+  list(
+    accuracy        = unname(cm$overall["Accuracy"]),
+    macro_precision = mean(bc$Precision,  na.rm = TRUE),
+    macro_recall    = mean(bc$Recall,     na.rm = TRUE),
+    macro_f1        = mean(bc$F1,         na.rm = TRUE),  # simple avg, unweighted
+    weighted_f1     = weighted_f1,                         # weighted by test-set class size
+    per_class_f1    = setNames(bc$F1, sub("^Class: ","", rownames(bc))),
+    per_class_n     = setNames(class_counts, levels(truth))
+  )
+}
+
+build_knn_matrix <- function(tr, te, vars) {
+  comb <- rbind(tr[vars], te[vars])
+  X    <- model.matrix(~ . - 1, data = comb)
+  n    <- nrow(tr)
+  Xtr  <- X[1:n, , drop = FALSE]
+  Xte  <- X[(n+1):nrow(X), , drop = FALSE]
+  mu <- colMeans(Xtr); sds <- apply(Xtr, 2, sd); sds[sds == 0] <- 1
+  list(train = scale(Xtr, mu, sds), test = scale(Xte, mu, sds))
+}
+
+safe_fit <- function(expr, label) {
+  tryCatch(expr, error = function(e) {
+    message(sprintf("  [FAIL] %s: %s", label, conditionMessage(e))); NULL
+  })
+}
+```
+
+## 3.2 Storage
+
+```{r storage}
+results        <- list()
+fitted_objects <- list()
+session_start  <- Sys.time()
+```
+
+## 3.3 Multinomial logistic regression
+
+```{r multinom_fit}
+for (b in block_order) {
+  set.seed(42)
+  cat(sprintf("Multinom %-8s ... ", b))
+  t0  <- Sys.time()
+  fit <- safe_fit(
+    nnet::multinom(blocks[[b]]$formula, data = train,
+                   MaxNWts = 50000, trace = FALSE, maxit = 200),
+    paste("multinom", b))
+  if (is.null(fit)) {
+    results[[paste0("multinom_",b)]] <- list(
+      accuracy=NA, macro_precision=NA, macro_recall=NA,
+      macro_f1=NA, weighted_f1=NA_real_, per_class_f1=NULL); next
+  }
+  pred <- predict(fit, newdata = test)
+  m    <- macro_metrics(pred, test$L3)
+  results[[paste0("multinom_",b)]] <- m
+  fitted_objects[[paste0("multinom_",b)]] <- fit
+  cat(sprintf("F1=%.3f  (%.1fs)\n", m$macro_f1,
+              as.numeric(difftime(Sys.time(), t0, units="secs"))))
+}
+```
+
+```{r multinom_elapsed, cache=FALSE}
+cat(sprintf("Multinom done. Elapsed: %.1f min\n",
+            as.numeric(difftime(Sys.time(), session_start, units="mins"))))
+```
+
+## 3.4 Classification tree (`rpart`)
+
+```{r rpart_fit}
+for (b in block_order) {
+  set.seed(42)
+  cat(sprintf("rpart    %-8s ... ", b))
+  t0  <- Sys.time()
+  fit <- safe_fit(
+    rpart::rpart(blocks[[b]]$formula, data = train,
+                 method = "class", control = rpart.control(cp = 0.001)),
+    paste("rpart", b))
+  if (is.null(fit)) {
+    results[[paste0("rpart_",b)]] <- list(
+      accuracy=NA, macro_precision=NA, macro_recall=NA,
+      macro_f1=NA, weighted_f1=NA_real_, per_class_f1=NULL); next
+  }
+  pred <- predict(fit, newdata = test, type = "class")
+  m    <- macro_metrics(pred, test$L3)
+  results[[paste0("rpart_",b)]] <- m
+  fitted_objects[[paste0("rpart_",b)]] <- fit
+  cat(sprintf("F1=%.3f  (%.1fs)\n", m$macro_f1,
+              as.numeric(difftime(Sys.time(), t0, units="secs"))))
+}
+```
+
+```{r rpart_elapsed, cache=FALSE}
+cat(sprintf("rpart done. Elapsed: %.1f min\n",
+            as.numeric(difftime(Sys.time(), session_start, units="mins"))))
+```
+
+## 3.5 k-NN (k = 5)
+
+Unlike the base version, `Zone_km` (9 dummies after one-hot) **is** included
+in the Spatial and Full k-NN matrices because it is a low-cardinality factor.
+
+```{r knn_fit}
+for (b in block_order) {
+  set.seed(42)
+  cat(sprintf("knn      %-8s ... ", b))
+  t0   <- Sys.time()
+  mats <- safe_fit(build_knn_matrix(train, test, blocks[[b]]$knn_vars),
+                   paste("knn-build", b))
+  if (is.null(mats)) {
+    results[[paste0("knn_",b)]] <- list(
+      accuracy=NA, macro_precision=NA, macro_recall=NA,
+      macro_f1=NA, weighted_f1=NA_real_, per_class_f1=NULL); next
+  }
+  pred <- safe_fit(class::knn(mats$train, mats$test, train$L3, k=5),
+                   paste("knn-pred", b))
+  if (is.null(pred)) {
+    results[[paste0("knn_",b)]] <- list(
+      accuracy=NA, macro_precision=NA, macro_recall=NA,
+      macro_f1=NA, weighted_f1=NA_real_, per_class_f1=NULL); next
+  }
+  m <- macro_metrics(pred, test$L3)
+  results[[paste0("knn_",b)]] <- m
+  cat(sprintf("F1=%.3f  (%.1fs)\n", m$macro_f1,
+              as.numeric(difftime(Sys.time(), t0, units="secs"))))
+}
+```
+
+```{r knn_elapsed, cache=FALSE}
+cat(sprintf("kNN done. Elapsed: %.1f min\n",
+            as.numeric(difftime(Sys.time(), session_start, units="mins"))))
+```
+
+## 3.6 Random forest (`ranger`)
+
+```{r ranger_fit}
+n_threads <- parallel::detectCores()
+for (b in block_order) {
+  set.seed(42)
+  cat(sprintf("ranger   %-8s ... ", b))
+  t0  <- Sys.time()
+  fit <- safe_fit(
+    ranger::ranger(blocks[[b]]$formula, data = train,
+                   num.trees  = 300,
+                   num.threads = n_threads,
+                   importance = "impurity",
+                   probability = FALSE,
+                   classification = TRUE,
+                   seed = 42,
+                   respect.unordered.factors = "order"),
+    paste("ranger", b))
+  if (is.null(fit)) {
+    results[[paste0("ranger_",b)]] <- list(
+      accuracy=NA, macro_precision=NA, macro_recall=NA,
+      macro_f1=NA, weighted_f1=NA_real_, per_class_f1=NULL); next
+  }
+  pred <- predict(fit, data = test)$predictions
+  m    <- macro_metrics(pred, test$L3)
+  results[[paste0("ranger_",b)]] <- m
+  fitted_objects[[paste0("ranger_",b)]] <- fit
+  cat(sprintf("F1=%.3f  (%.1fs)\n", m$macro_f1,
+              as.numeric(difftime(Sys.time(), t0, units="secs"))))
+}
+```
+
+```{r ranger_elapsed, cache=FALSE}
+cat(sprintf("ranger done. Elapsed: %.1f min\n",
+            as.numeric(difftime(Sys.time(), session_start, units="mins"))))
+cat("All 20 models fitted.\n")
+```
+
+# 4. Evaluation
+
+## 4.0 Metric reference
+
+All four metrics are computed for **every model × every feature block**
+(20 combinations). The table below explains when each is the right lens for
+the research question.
+
+| Metric | Formula | When to use here |
+|---|---|---|
+| **Weighted F1** | \(\sum_c \frac{n_c}{N} F1_c\) — F1 weighted by test-set class size | Best headline metric for **overall model performance** — gives large classes (Theft from shop, ~13k) more influence, mirrors real-world deployment |
+| **Macro F1** | \(\frac{1}{C}\sum_c F1_c\) — simple average across all 28 L3 classes | Best for answering the **research question** — treats every subtype equally, penalises models that ignore rare classes (Murder, n=9) |
+| **Accuracy** | Correct predictions / total | Reported for completeness; **do not use for model selection** here — a model that always predicts "Theft from shop" scores ~18% accuracy while being useless |
+| **Per-class F1** | F1 for each individual L3 subtype | Best for understanding **rare class performance** and where each model fails |
+
+> **Primary metric for model selection → Macro F1.**
+> Weighted F1 is reported alongside it as a secondary metric reflecting
+> real-world frequency-weighted performance.
+
+```{r metric_note, echo=FALSE}
+cat("Metrics computed for all", length(results), "model-block combinations.\n")
+```
+
+## 4.1 McFadden's pseudo-R² for multinomial logits
+
+```{r mcfadden}
+mcfadden <- data.frame(Feature_Block = block_order,
+                       McFadden_R2   = NA_real_,
+                       row.names     = NULL)
+for (i in seq_along(block_order)) {
+  b   <- block_order[i]
+  fit <- fitted_objects[[paste0("multinom_",b)]]
+  if (is.null(fit)) next
+  r2 <- tryCatch(suppressWarnings(pscl::pR2(fit))["McFadden"],
+                 error = function(e) NA_real_)
+  mcfadden$McFadden_R2[i] <- as.numeric(r2)
+}
+print(mcfadden)
+```
+
+## 4.2 Per-class F1 — all 28 L3 subtypes × all 4 models (Full block)
+
+```{r perclass_full}
+# Collect per-class F1 for all 4 models on the Full block
+models_full <- c("multinom_Full","rpart_Full","knn_Full","ranger_Full")
+model_labels <- c("Multinom","Tree","kNN","RF")
+
+# Build combined per-class F1 table
+all_classes <- levels(df$L3)
+class_n     <- as.integer(table(df$L3))
+
+perclass_tbl <- data.frame(
+  L3_Class = all_classes,
+  N_total  = class_n,
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(models_full)) {
+  nm  <- models_full[i]
+  lbl <- model_labels[i]
+  f1_vec <- if (!is.null(results[[nm]]) && !is.null(results[[nm]]$per_class_f1))
+              results[[nm]]$per_class_f1[all_classes]
+            else
+              rep(NA_real_, length(all_classes))
+  perclass_tbl[[paste0("F1_", lbl)]] <- round(as.numeric(f1_vec), 3)
+}
+
+# Best F1 across models for each class
+f1_cols <- paste0("F1_", model_labels)
+perclass_tbl$Best_F1  <- apply(perclass_tbl[f1_cols], 1, max, na.rm = TRUE)
+perclass_tbl$Best_Model <- model_labels[
+  apply(perclass_tbl[f1_cols], 1,
+        function(x) if (all(is.na(x))) NA_integer_ else which.max(x))
+]
+
+perclass_tbl <- perclass_tbl[order(perclass_tbl$N_total), ]
+rownames(perclass_tbl) <- NULL
+cat("=== Per-class F1 — Full block, all 4 models, sorted by class frequency ===\n")
+print(perclass_tbl, digits = 3)
+```
+
+## 4.3 Rare-class F1 spotlight — 8 rarest L3 subtypes across all 20 models
+
+```{r rare_f1}
+# 8 rarest classes in the full dataset
+rare_classes <- names(sort(table(df$L3)))[1:8]
+
+rare_tbl <- data.frame(
+  L3_Class = rare_classes,
+  N_total  = as.integer(table(df$L3)[rare_classes]),
+  stringsAsFactors = FALSE
+)
+
+# For every model × every block, extract F1 for each rare class
+for (nm in names(results)) {
+  if (is.null(results[[nm]]) || is.null(results[[nm]]$per_class_f1)) next
+  parts <- strsplit(nm, "_", fixed = TRUE)[[1]]
+  col   <- paste0(parts[1], "_", parts[2])
+  f1v   <- results[[nm]]$per_class_f1[rare_classes]
+  rare_tbl[[col]] <- round(as.numeric(f1v), 3)
+}
+
+cat("=== Rare-class F1 across all 20 model-block combinations ===\n")
+cat("(NA = class never predicted by that model)\n\n")
+print(rare_tbl, digits = 3)
+
+# Summary: which model-block achieves highest average F1 on rare classes only?
+f1_cols_rare <- setdiff(names(rare_tbl), c("L3_Class","N_total"))
+avg_rare_f1  <- sort(sapply(f1_cols_rare, function(cc)
+  mean(rare_tbl[[cc]], na.rm = TRUE)), decreasing = TRUE)
+
+cat("\n=== Average F1 on the 8 rarest classes (model ranking for rare subtypes) ===\n")
+print(round(head(avg_rare_f1, 10), 3))
+```
+
+
+# 5. Summary comparison table
+
+```{r summary_table}
+summary_tbl <- do.call(rbind, lapply(names(results), function(nm) {
+  parts <- strsplit(nm, "_", fixed = TRUE)[[1]]
+  data.frame(
+    Model         = parts[1],
+    Feature_Block = parts[2],
+    Accuracy      = results[[nm]]$accuracy,
+    Weighted_F1   = results[[nm]]$weighted_f1,   # primary for deployment
+    Macro_F1      = results[[nm]]$macro_f1,       # primary for research question
+    Macro_Prec    = results[[nm]]$macro_precision,
+    Macro_Recall  = results[[nm]]$macro_recall,
+    stringsAsFactors = FALSE
+  )
+}))
+
+summary_tbl$Model <- dplyr::recode(summary_tbl$Model,
+  multinom = "Multinomial Logit",
+  rpart    = "Classification Tree",
+  knn      = "k-NN (k=5)",
+  ranger   = "Random Forest")
+
+summary_tbl$Feature_Block <- factor(summary_tbl$Feature_Block,
+                                    levels = block_order)
+
+# Sort by Macro_F1 (research question lens)
+summary_tbl <- summary_tbl[order(-summary_tbl$Macro_F1), ]
+rownames(summary_tbl) <- NULL
+
+cat("=== All 20 model-block combinations, sorted by Macro F1 ===\n")
+print(summary_tbl, digits = 3)
+
+cat("\n=== Same table, sorted by Weighted F1 (deployment lens) ===\n")
+print(summary_tbl[order(-summary_tbl$Weighted_F1), ], digits = 3)
+```
+
+# 6. Plots
+
+## 6.1 Macro F1 and Weighted F1 by feature block
+
+```{r line_plot, fig.height=8}
+plot_df <- summary_tbl %>%
+  pivot_longer(cols = c(Macro_F1, Weighted_F1),
+               names_to = "Metric", values_to = "F1") %>%
+  mutate(
+    Feature_Block = factor(Feature_Block, levels = block_order),
+    Metric = dplyr::recode(Metric,
+      Macro_F1    = "Macro F1  (research question — equal class weight)",
+      Weighted_F1 = "Weighted F1  (deployment — frequency-weighted)")
+  )
+
+ggplot(plot_df,
+       aes(x = Feature_Block, y = F1,
+           colour = Model, group = Model)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ Metric, ncol = 1, scales = "free_y") +
+  scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(title    = "Marginal gain by feature group: Macro F1 vs Weighted F1",
+       subtitle = "Spatial block = 10-level k-means Zone_km",
+       x = "Feature block (Baseline to Full)",
+       y = "F1 score (test set)",
+       colour = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 10))
+```
+
+## 6.2 Variable importance — full random forest
+
+```{r vimp_plot}
+rf_full_fit <- fitted_objects[["ranger_Full"]]
+if (!is.null(rf_full_fit)) {
+  vi    <- ranger::importance(rf_full_fit)
+  vi_df <- data.frame(Feature = names(vi), Importance = as.numeric(vi))
+
+  group_lookup <- c(
+    L1 = "Baseline", L2 = "Baseline",
+    Cal_Month = "Temporal", Cal_DayOfWeek = "Temporal",
+    Season_SH = "Temporal", IsPublicHoliday_SA = "Temporal",
+    IsLongWeekend = "Temporal", IsSchoolHoliday_SA = "Temporal",
+    Zone_km = "Spatial",                           # engineered zone
+    sal_adv_dis = "SEIFA", sal_dis = "SEIFA",
+    sal_Economic_Resources = "SEIFA", sal_Employment = "SEIFA")
+
+  vi_df$Group <- factor(group_lookup[vi_df$Feature],
+                        levels = c("Baseline","Temporal","Spatial","SEIFA"))
+  vi_df <- vi_df[order(-vi_df$Importance), ]
+  vi_df$Feature <- factor(vi_df$Feature, levels = rev(vi_df$Feature))
+
+  group_colours <- c(Baseline = "grey60", Temporal = "orange",
+                     Spatial  = "steelblue", SEIFA   = "forestgreen")
+
+  ggplot(vi_df, aes(x = Feature, y = Importance, fill = Group)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = group_colours) +
+    labs(title    = "Random forest variable importance (Full model, Zone_km spatial)",
+         subtitle = "Bars coloured by feature group",
+         x = NULL, y = "Mean decrease in Gini (impurity)") +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+} else {
+  cat("Full RF not fitted; skipping importance plot.\n")
+}
+```
+
+## 6.3 Decision tree — full classification tree
+
+The full tree fitted with `cp = 0.001` typically grows 15–25 levels deep,
+making a single plot unreadable. We display it in two ways:
+
+* **Inline (HTML):** top 5 levels only, coloured by majority-class purity
+  (`box.palette = "RdYlGn"`: red = mixed nodes, green = pure nodes). This
+  shows the key early splits that account for most of the classification gain.
+* **PDF export:** the complete tree across a very wide landscape canvas, saved
+  to `tree_full_complete.pdf` in the `TRY2/` folder for detailed inspection.
+
+```{r tree_plot, fig.width=18, fig.height=11, fig.align="center"}
+tree_full <- fitted_objects[["rpart_Full"]]
+
+if (!is.null(tree_full)) {
+
+  # Tree stats
+  n_leaves   <- sum(tree_full$frame$var == "<leaf>")
+  n_splits   <- sum(tree_full$frame$var != "<leaf>")
+  tree_depth <- max(rpart:::tree.depth(as.integer(rownames(tree_full$frame))))
+  cat(sprintf("Full tree — depth: %d | terminal nodes: %d | internal splits: %d\n",
+              tree_depth, n_leaves, n_splits))
+
+  # ── 1. Inline: refit a shallow display tree (maxdepth = 5) ────────────
+  # We refit rather than prune so the visual accurately represents the
+  # top-5-level structure without inheriting the deep tree's cp table.
+  set.seed(42)
+  tree_display <- rpart::rpart(
+    blocks[["Full"]]$formula, data = train,
+    method  = "class",
+    control = rpart.control(cp = 0.001, maxdepth = 5)
+  )
+
+  prp(
+    tree_display,
+    type          = 2,        # split label centred above node
+    extra         = 106,      # class + % of class + % observations
+    fallen.leaves = FALSE,    # leaves float at depth — no bottom pile-up
+    box.palette   = "RdYlGn", # red (impure) → yellow → green (pure)
+    shadow.col    = "gray80", # drop shadow for depth perception
+    branch        = 0.4,      # shorter diagonals — less crowding
+    compress      = TRUE,
+    gap           = 0,
+    tweak         = 1.15,
+    cex           = 0.65,
+    main          = sprintf(
+      "Full classification tree: top 5 levels (maxdepth=5, cp=0.001)\nFull tree has depth %d and %d terminal nodes - see PDF",
+      tree_depth, n_leaves)
+  )
+
+  # ── 2. PDF: complete deep tree, very wide landscape ───────────────────
+  pdf_path <- "tree_full_complete.pdf"
+  pdf(pdf_path, width = 36, height = 20)
+  prp(
+    tree_full,
+    type          = 2,
+    extra         = 104,      # class + % coverage (compact label)
+    fallen.leaves = FALSE,
+    box.palette   = "RdYlGn",
+    shadow.col    = "gray80",
+    branch        = 0.2,      # very short branches → more horizontal room
+    compress      = TRUE,
+    gap           = 0,
+    space         = 0.8,
+    tweak         = 0.6,
+    cex           = 0.35,
+    main          = sprintf(
+      "Full classification tree: %d terminal nodes, depth %d  (cp=0.001, Zone_km spatial)",
+      n_leaves, tree_depth)
+  )
+  invisible(dev.off())
+  cat(sprintf("Complete tree saved → %s\n", normalizePath(pdf_path)))
+
+} else {
+  cat("Full rpart not fitted; skipping tree plot.\n")
+}
+```
+
+# 7. Save artefacts
+
+```{r save_artefacts}
+out_dir <- "."
+write.csv(summary_tbl,
+          file.path(out_dir, "L3_FE_summary_table.csv"), row.names = FALSE)
+write.csv(mcfadden,
+          file.path(out_dir, "L3_FE_mcfadden_r2.csv"), row.names = FALSE)
+write.csv(as.data.frame(zone_summary),
+          file.path(out_dir, "L3_FE_zone_membership.csv"), row.names = FALSE)
+write.csv(as.data.frame(zone_top5),
+          file.path(out_dir, "L3_FE_zone_top5_suburbs.csv"), row.names = FALSE)
+cat("Wrote to", normalizePath(out_dir), "\n")
+cat("  L3_FE_summary_table.csv\n")
+cat("  L3_FE_mcfadden_r2.csv\n")
+cat("  L3_FE_zone_membership.csv\n")
+cat("  L3_FE_zone_top5_suburbs.csv\n")
+```
+
+---
+
+# B. Interpretation guide
+
+## B.1 Why engineer zones rather than use raw suburbs?
+
+Raw `Suburb_Incident` (351 levels) is informative but **computationally
+intractable for multinomial logit** and potentially *over-fitting* for
+tree-based models (it memorises suburb-specific noise). `Zone_km` clusters
+suburbs by *why* they differ — density, disadvantage, employment, economic
+resources — so the model learns a meaningful grouping rather than a suburb
+lookup table. A jump in F1 from +Spatial (Zone_km) confirms that
+*geographic character* (not just suburb identity) explains L3 variation.
+
+## B.2 How to read the summary table
+
+The Baseline row is the lower bound: what L1 + L2 alone can predict. Each
+subsequent block's F1 gain is the **marginal contribution** of that feature
+group holding all else constant. A gain of **≥ 0.05** is substantial;
+**0.01–0.05** is modest; **< 0.01** means the group is redundant given
+the hierarchy.
+
+## B.3 How to read the line plot
+
+The steepest segment identifies the most informative feature group. A flat
+line means that block is already absorbed by earlier features or that the
+model cannot exploit it linearly. Random forest gains more from Spatial
+than multinomial logit does because it captures non-linear suburb-cluster
+interactions.
+
+## B.4 McFadden's pseudo-R²
+
+Values of 0.10–0.20 are considered **good** in multiclass settings (McFadden
+is much stricter than ordinary R²). Monotonically rising R² across blocks
+confirms each group adds information.
+
+## B.5 Variable importance (random forest)
+
+`Zone_km` is a **single** 10-level variable, so its raw Gini importance is
+comparable to other individual variables (unlike the raw suburb factor which
+would inflate importance by cardinality alone). If `Zone_km` appears near the
+top of the importance chart, geographic character genuinely discriminates L3.
+
+## B.6 Decision tree
+
+The first split after L2 reveals whether spatial zone, a temporal feature,
+or SEIFA is the most discriminating. A Zone_km split at the root (e.g.
+"Zone_3 vs all others") tells you that the CBD/commercial spatial type
+resolves an L3 ambiguity that L2 alone cannot.
+
+## B.7 Caveats
+
+* 1,432:1 class imbalance — macro-F1 down-weights dominant classes. Per-class
+  F1 for Murder (n ≈ 9) is statistically unstable; caveat any claim about
+  rare subtypes accordingly.
+* `Zone_km` compresses suburb-level signal; very fine-grained spatial effects
+  (e.g. a single suburb with an unusual crime mix) may be lost within a zone.
+  The base version (`L3_Conditional_Modelling.Rmd`) retains raw suburbs for
+  comparison.
+* SEIFA and `Zone_km` share variance (both derived from SEIFA deciles + suburb
+  counts). A modest SEIFA gain given `+Spatial` is expected.
